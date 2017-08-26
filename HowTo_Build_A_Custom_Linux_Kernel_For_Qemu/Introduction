@@ -1,0 +1,397 @@
+
+http://mgalgs.github.io/2012/03/23/how-to-build-a-custom-linux-kernel-for-qemu.html
+=======================================================================
+How to Build A Custom Linux Kernel For Qemu
+23 Mar 2012
+=======================================================================
+
+HEADS UP Please see my updated version of this tutorial: How to Build a Custom Linux Kernel for Qemu (2015 Edition). I'm leaving this post here for historical purposes only.
+
+In this howto, we’re going to build a Linux system from the ground up using kernel sources from kernel.org and a busybox-based initramfs, which we will then run under qemu.
+
+Initial Ramdisk
+Linux needs something called the initial ramdisk in order to complete its boot process. The initial ramdisk is a filesystem image that is mounted temporarily at / while the Linux boots. The purpose of the initial ramdisk is to provide kernel modules and necessary utilities that might be needed in order to bring up the real root filesystem.
+
+As outlined in the initrd Wikipedia article, there are currently two approaches that fulfill the role of the initial ramdisk: initrd and initramfs. We’ll be using the initramfs approach.
+
+The gentoo-wiki has a great article about initramfs. We’ll be following that article closely here.
+
+We’ll be creating everything under ~/linux_qemu:
+
+$ mkdir ~/linux_qemu
+$ cd ~/linux_qemu
+First, create some directory structure for our initramfs:
+
+$ mkdir initramfs
+$ cd initramfs/
+$ mkdir -pv bin lib dev etc mnt/root proc root sbin sys
+$ sudo cp -va /dev/{null,console,tty} dev/
+Now we need some stuff to put in our initial ramdisk. We’ll be using busybox since it provides a multitude of useful utilities all in a single binary.
+
+Building BusyBox
+Now we’ll compile busybox:
+
+$ cd ~/linux_qemu
+$ wget http://busybox.net/downloads/busybox-1.19.4.tar.bz2
+$ tar xf busybox-1.19.4.tar.bz2
+$ cd busybox-1.19.4/
+For some reason I had to fix up some includes to get things working here. Newer versions of busybox might not have this issue, I haven’t really pursued the issue… If you have issues compiling you might want to apply my patch:
+
+$ patch -p1 < <(wget https://raw.github.com/gist/3863017/f6d96af7b7cab9346adaf21aa7f05e0cfb722bef/struct_rlimit.diff -q -O-)
+Now configure busybox:
+
+$ make menuconfig
+The options I changed were:
+
+CONFIG_DESKTOP=n
+CONFIG_EXTRA_CFLAGS=-m32 -march=i386 (might not need this if compiling on a 32-bit host)
+CONFIG_MKFS_EXT2=n
+Compile:
+
+$ make
+$ make install
+Copy the freshly-built busybox system to our initramfs staging area:
+
+$ sudo cp -avR _install/* ../initramfs/
+Now let’s have a look at what shared libraries we’ll need to include in our system:
+
+$ cd ~/linux_qemu/initramfs
+$ ldd bin/busybox
+        linux-gate.so.1 =>  (0xf76f7000)
+        libm.so.6 => /usr/lib/libm.so.6 (0xf76a1000)
+        libc.so.6 => /usr/lib/libc.so.6 (0xf74fe000)
+        /lib/ld-linux.so.2 (0xf76f8000)
+At this point I did something very hacky and copied over some libraries from the host machine. This is almost definitely not the right way to do it, but it’s working for now so oh well…
+
+$ mkdir -pv usr/lib
+$ cp -av /usr/lib/lib[mc].so.6 usr/lib/
+$ cp -av /usr/lib/lib[mc]-2.16.so usr/lib/
+$ cp -av /usr/lib/ld-2.16.so usr/lib/
+$ cp -av /lib/ld-linux.so.2 lib/
+$ cp -av /lib/ld-2.16.so lib/
+I believe the correct way to do it would be cross-compile glibc in a bootstrapped environment similar to how it’s done in the Linux From Scratch book. It’s really kind of tricky to get around the host-library dependency stuff…
+
+It’s also worth mentioning another tool at this point: uclibc. uclibc is a small C Library targeting embedded systems. It also comes with a very slick build system called buildroot that makes it dead simple to build a full embedded system complete with a cross-compiled toolchain, root filesystem, kernel image and bootloader. It basically automates everything we’re doing in this tutorial (and uses a different C Libary). Anyways, it’s a very cool tool, so maybe I’ll cover building a qemu system with uclibc in another howto.
+
+Init
+Now we just need to create /init which will be called by Linux at the last stage of the boot process.
+
+$ emacs ~/linux_qemu/initramfs/init
+Here’s the contents of my /init:
+
+#!/bin/sh
+
+/bin/mount -t proc none /proc
+/bin/mount -t sysfs sysfs /sys
+
+cat <<'EOF'
+                       _             _ _                  
+ _ __ ___   __ _  __ _| | __ _ ___  | (_)_ __  _   ___  __
+| '_ ` _ \ / _` |/ _` | |/ _` / __| | | | '_ \| | | \ \/ /
+| | | | | | (_| | (_| | | (_| \__ \ | | | | | | |_| |>  < 
+|_| |_| |_|\__, |\__,_|_|\__, |___/ |_|_|_| |_|\__,_/_/\_\
+           |___/         |___/                            
+
+EOF
+echo 'Enjoy your new system!'
+
+/bin/sh
+Make /init executable:
+
+$ chmod 755 ~/linux_qemu/initramfs/init
+We should now have everything necessary for our initramfs. We will cpio it up:
+
+$ cd ~/linux_qemu/initramfs
+$ find . -print0 | cpio --null -ov --format=newc > ../my-initramfs.cpio
+We avoid gzip‘ing it here because the emulator takes forever to unpack it if we do…
+
+If you want to see how to build a tiny Linux system from scratch using the initrd method, you can refer to this awesome presentation.
+
+Kernel Configuration
+$ cd ~/linux_qemu
+$ wget http://www.kernel.org/pub/linux/kernel/v3.x/linux-3.3.tar.xz
+$ tar xf linux-3.3.tar.xz
+$ cd linux-3.3/
+We’ll start with a minimal configuration, then add only what we need:
+
+$ make allnoconfig
+$ make menuconfig
+I added:
+
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_INITRAMFS_SOURCE=/home/mgalgs/linux_qemu/initramfs
+CONFIG_PCI=y
+CONFIG_BINFMT_ELF=y
+CONFIG_SERIAL_8250
+CONFIG_EXT2_FS=y
+CONFIG_IA32_EMULATION=y # might not need if on 32-bit host
+CONFIG_NET=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_WIRELESS=n
+CONFIG_ATA=y
+CONFIG_NETDEVICES=y
+CONFIG_NET_VENDOR_REALTEK=y
+CONFIG_8139TOO=y (unchecked all other Ethernet drivers)
+CONFIG_WLAN=n
+
+CONFIG_DEVTMPFS=y
+You can see my entire kernel .config here.
+
+Now we’re ready to build the kernel:
+
+$ make
+Our kernel image should now be available at linux-3.3/arch/x86/boot/.
+
+Final Preparations
+Now we’ll just create a little hard disk to play around with:
+
+$ cd ~/linux_qemu
+$ qemu-img create disk.img 512M
+$ mkfs.ext2 -F disk.img
+Boot
+We can now run our kernel in qemu:
+
+$ qemu-system-i386 -hda disk.img -kernel ../linux-3.3/arch/x86/boot/bzImage -initrd my-initramfs.cpio
+Success!
+
+
+
+
+http://mgalgs.github.io/2015/05/16/how-to-build-a-custom-linux-kernel-for-qemu-2015-edition.html
+========================================================================
+How to Build A Custom Linux Kernel For Qemu (2015 Edition)
+16 May 2015
+This is an updated version of my Linux Kernel/Qemu tutorial from 2012.
+========================================================================
+
+In this tutorial, we’ll be building a custom Linux kernel and userland to run on qemu. We’ll start with something basic and easy, then we’ll whittle it down until we’re booting straight to an infinite loop of nops (ok, not quite that far). The host and target will both be x86.
+
+(UPDATE) 2017-03-29: kernel and busybox versions updated to the latest stable releases.
+
+Preparation
+
+First, create a workspace:
+
+$ TOP=$HOME/teeny-linux
+$ mkdir $TOP
+Our entire system will be composed of exactly two packages: the Linux kernel and Busybox. Download and extract them now:
+
+$ cd $TOP
+$ curl https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.10.6.tar.xz | tar xJf -
+$ curl https://busybox.net/downloads/busybox-1.26.2.tar.bz2 | tar xjf -
+Busybox Userland
+
+The first thing we’ll do is create a minimal userland based on the ever-useful busybox tool. After building busybox, we’ll throw it in a minimal filesystem hierarchy and package it up in an initramfs using cpio.
+
+Let’s go configure busybox now:
+
+$ cd $TOP/busybox-1.26.2
+$ mkdir -pv ../obj/busybox-x86
+$ make O=../obj/busybox-x86 defconfig
+(Note: in the busybox build system, O= means “place build output here”. This allows you to host multiple different configurations out of the same source tree. The Linux kernel follows a similar convention.)
+
+This gives us a basic starting point. We’re going to take the easy way out here and just statically link busybox in order to avoid fiddling with shared libraries. We’ll need to use busybox’s menuconfig interface to enable static linking:
+
+$ make O=../obj/busybox-x86 menuconfig
+type /, search for “static”. You’ll see that the option is located at:
+
+-> Busybox Settings
+  -> Build Options
+[ ] Build BusyBox as a static binary (no shared libs)
+Go to that location, select it, save, and exit.
+
+Now build busybox:
+
+$ cd ../obj/busybox-x86
+$ make -j2
+$ make install
+So far so good. With a statically-linked busybox in hand we can build the directory structure for our initramfs:
+
+$ mkdir -pv $TOP/initramfs/x86-busybox
+$ cd $TOP/initramfs/x86-busybox
+$ mkdir -pv {bin,sbin,etc,proc,sys,usr/{bin,sbin}}
+$ cp -av $TOP/obj/busybox-x86/_install/* .
+Of course, there’s a lot missing from this skeleton hierarachy that will cause a lot of applications to break (no /etc/passwd, for example), but it’s enough to boot to a shell, so we’ll live with it for the sake of brevity. If you want to flesh it out more you can refer to these sections of Linux From Scratch.
+
+One absolutely critical piece of our userland that’s still missing is an init program. We’ll just write a tiny shell script and use it as our init:
+
+$ vim init
+And enter the following:
+
+#!/bin/sh
+ 
+mount -t proc none /proc
+mount -t sysfs none /sys
+ 
+echo -e "\nBoot took $(cut -d' ' -f1 /proc/uptime) seconds\n"
+ 
+exec /bin/sh
+view rawinit hosted with ❤ by GitHub
+and make it executable:
+
+$ chmod +x init
+The Gentoo wiki’s Custom Initramfs page is a great reference for building a minimalistic initramfs if you’d like to learn more.
+
+We’re now ready to cpio everything up:
+
+$ find . -print0 \
+    | cpio --null -ov --format=newc \
+    | gzip -9 > $TOP/obj/initramfs-busybox-x86.cpio.gz
+We now have a minimal userland in $TOP/obj/initramfs-busybox-x86.cpio.gz that we can pass to qemu as an initrd (using the -initrd option). But before we can do that we need a kernel…
+
+Linux Kernel
+
+Basic Kernel Config
+For our not-yet-trimmed-down baseline, let’s build a kernel using the default x86_64 configuration that ships with the kernel tree. Apply the configuration like so:
+
+$ cd $TOP/linux-4.10.6
+$ make O=../obj/linux-x86-basic x86_64_defconfig
+We can also merge in a few config options that improve performance/functionality of kvm guests with:
+
+$ make O=../obj/linux-x86-basic kvmconfig
+The kernel is now configured and ready to build. Go ahead and build it:
+
+$ make O=../obj/linux-x86-basic -j2
+Now that we have a kernel and a userland, we’re ready to boot! You can use qemu-system-x86_64 to try out your new system:
+
+$ cd $TOP
+$ qemu-system-x86_64 \
+    -kernel obj/linux-x86-basic/arch/x86_64/boot/bzImage \
+    -initrd obj/initramfs-busybox-x86.cpio.gz \
+    -nographic -append "console=ttyS0"
+Exit the VM by hitting Ctl-a c then typing “quit” at the qemu monitor shell.
+
+If your host processor and kernel have virtualization extensions you can add the -enable-kvm flag to really speed things up:
+
+$ qemu-system-x86_64 \
+    -kernel obj/linux-x86-basic/arch/x86_64/boot/bzImage \
+    -initrd obj/initramfs-busybox-x86.cpio.gz \
+    -nographic -append "console=ttyS0" -enable-kvm
+Smaller Kernel Config
+That’s great and all, but if we really just want a tiny system with nothing but busybox on it we can remove a bunch of stuff from our kernel. By trimming down our kernel config we can reduce the size of our kernel image and reduce boot time.
+
+Let’s try using the kernel’s Kbuild defaults as our baseline. The Kbuild defaults are generally quite conservative since Linus Torvalds has declared that in the kernel unless the feature cures cancer, it’s not on by default, as opposed to the x86_64_defconfig which is meant to provide a lot of generally useful features and work on a wide variety of x86 targets.
+
+You can apply this more conservative configuration based on the Kbuild defaults by using the alldefconfig target:
+
+$ cd $TOP/linux-4.10.6
+$ make O=../obj/linux-x86-alldefconfig alldefconfig
+We need to enable a few more options in order to actually be able to use this configuration.
+
+First, we need to enable a serial driver so that we can get a serial console. Run your preferred kernel configurator (I like nconfig, but you can use menuconfig, xconfig, etc.):
+
+$ make O=../obj/linux-x86-alldefconfig nconfig
+Navigate to:
+
+-> Device Drivers
+  -> Character devices
+    -> Serial drivers
+and enable the following options:
+
+[*] 8250/16550 and compatible serial support
+[*] Console on 8250/16550 and compatible serial port
+We also need to enable initramfs support, so that we can actually boot our userland. Go to:
+
+-> General setup
+and select:
+
+[*] Initial RAM filesystem and RAM disk (initramfs/initrd) support
+You can also deselect all of the decompressors except gzip, since that’s what we’re using.
+
+Finally, enable some features for kvm guests (not actually necessary to get the system booting, but hey):
+
+$ make O=../obj/linux-x86-alldefconfig kvmconfig
+And build:
+
+$ make O=../obj/linux-x86-alldefconfig -j2
+We now have a much smaller kernel image:
+
+$ (cd $TOP; du -hs obj/linux-x86-*/vmlinux)
+6.5M    obj/linux-x86-alldefconfig/vmlinux
+19M     obj/linux-x86-basic/vmlinux
+Now you can boot the new kernel (with our same userspace):
+
+$ qemu-system-x86_64 \
+    -kernel obj/linux-x86-alldefconfig/arch/x86_64/boot/bzImage \
+    -initrd obj/initramfs-busybox-x86.cpio.gz \
+    -nographic -append "console=ttyS0" -enable-kvm
+Not only is it smaller than the last one, but it boots faster too!
+
+Configuration	Boot time (seconds)
+x86_64_defconfig + kvmconfig	1.73
+alldefconfig + custom stuff + kvmconfig	0.61
+Smallest Kernel Config
+We saw a 3x decrease in kernel image size and boot time by using a smaller set of default options. But how much smaller and “faster” can we go?
+
+Let’s prune the image down even further by starting with absolutely nothing. The kernel build system has a make target for this: allnoconfig. Let’s create a new configuration based on that:
+
+$ cd $TOP/linux-4.10.6
+$ make O=$TOP/obj/linux-x86-allnoconfig allnoconfig
+Now everything that can be turned off is turned off. This is as low as it goes without hacking up the kernel source. As one might expect, we have a little more work to do in order to get something that actually boots in qemu. There isn’t a ton to do, which is actually pretty incredible.
+
+Fire up your kernel configurator:
+
+$ make O=../obj/linux-x86-allnoconfig nconfig
+Here are the options you need to turn on:
+
+[*] 64-bit kernel
+
+-> General setup
+  -> Configure standard kernel features
+[*] Enable support for printk
+
+-> General setup
+[*] Initial RAM filesystem and RAM disk (initramfs/initrd) support
+
+-> Executable file formats / Emulations
+[*] Kernel support for ELF binaries
+[*] Kernel support for scripts starting with #!
+
+-> Device Drivers
+  -> Character devices
+[*] Enable TTY
+
+-> Device Drivers
+  -> Character devices
+    -> Serial drivers
+[*] 8250/16550 and compatible serial support
+[*]   Console on 8250/16550 and compatible serial port
+
+-> File systems
+  -> Pseudo filesystems
+[*] /proc file system support
+[*] sysfs file system support
+In order to keep things truly tiny, we’ll skip make kvmconfig. Build it:
+
+$ make O=../obj/linux-x86-allnoconfig -j2
+The resulting image is quite a bit smaller than our last one, and way smaller than the one based on x86_64_defconfig:
+
+$ (cd $TOP; du -hs obj/linux-x86-*/vmlinux)
+6.5M    obj/linux-x86-alldefconfig/vmlinux
+2.7M    obj/linux-x86-allnoconfig/vmlinux
+19M     obj/linux-x86-basic/vmlinux
+Adding make kvmconfig increases the image size to 5M, so allnoconfig isn’t actually a huge win in terms of size against alldefconfig.
+
+And boot it:
+
+$ qemu-system-x86_64 \
+    -kernel obj/linux-x86-allnoconfig/arch/x86_64/boot/bzImage \
+    -initrd obj/initramfs-busybox-x86.cpio.gz \
+    -nographic -append "console=ttyS0" -enable-kvm
+Our new tiniest kernel boots about twice as fast as the alldefconfig one and about 5x as fast as the one based on x86_64_defconfig. Adding kvmconfig didn’t really affect boot time.
+
+Configuration	Boot time (seconds)
+x86_64_defconfig + kvmconfig	1.73
+alldefconfig + custom stuff + kvmconfig	0.61
+allnoconfig + custom stuff	0.36
+allnoconfig + custom stuff + kvmconfig	0.39
+Conclusion
+
+The most obvious application for this type of work is in the embedded space. However, I could see how it might also be beneficial in elastic cloud computing to reduce boot times and memory footprint. Please leave a comment if you’re aware of anyone doing this in “the cloud”!
+
+If nothing else it’s an interesting exercise! :
+
+
+
